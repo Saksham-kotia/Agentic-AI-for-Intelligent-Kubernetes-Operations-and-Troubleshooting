@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: gemma-system
+
+resources:
+  - namespace.yaml
+  - pvcs.yaml
+  # - gemma-1b-deployment.yaml
+  # - gemma-9b-deployment.yaml
+  # - gemma-27b-deployment.yaml
+  # - gemma-4-26b-deployment.yaml
+  # - gemma-4-26b-q3-deployment.yaml
+  # - gemma-4-26b-q5-deployment.yaml
+  # - gemma-4-26b-q6-deployment.yaml
+  - gemma-4-e4b-deployment.yaml
+
+labels:
+  - pairs:
+      demo: argo-rollouts

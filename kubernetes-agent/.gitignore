@@ -1,0 +1,82 @@
+# ==============================================================================
+# Java / Maven / Spring Boot
+# ==============================================================================
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+# https://github.com/takari/maven-wrapper#usage-without-binary-jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# Compiled class files
+*.class
+
+# Log files
+*.log
+
+# Package Files
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# ==============================================================================
+# IDEs and Editors
+# ==============================================================================
+# IntelliJ IDEA
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# Eclipse / Spring Tool Suite
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!bin/issues/
+!bin/scripts/
+
+# VS Code
+.vscode/
+
+# Vim / Emacs
+*~
+*.swp
+*.swo
+
+# ==============================================================================
+# Operating System Files
+# ==============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ==============================================================================
+# Project Specific & Secrets
+# ==============================================================================
+# Never commit environment variables or secrets!
+.env
+.env.*
+deployment/secret.yaml
+
+# Ignore agent cloned repos or temporary workspace directories if any are created locally
+agent-workspace/
+temp/
+tmp/

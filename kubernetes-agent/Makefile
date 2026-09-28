@@ -1,0 +1,51 @@
+.PHONY: build test clean docker-build docker-push deploy docker-buildx docker-buildx-push
+
+IMAGE ?= csanchez/kubernetes-agent:latest
+PLATFORMS ?= linux/amd64,linux/arm64
+
+CONTEXT ?= $(shell kubectl config current-context)
+
+build:
+	mvn clean package
+
+test:
+	mvn test
+
+clean:
+	mvn clean
+
+docker-build:
+	docker build -t $(IMAGE) .
+
+docker-buildx:
+	docker buildx create --name multiarch --use || docker buildx use multiarch
+	docker buildx build --platform $(PLATFORMS) --provenance=false -t $(IMAGE) --load .
+
+docker-buildx-push:
+	docker buildx create --name multiarch --use || docker buildx use multiarch
+	docker buildx build --platform $(PLATFORMS) --provenance=false -t $(IMAGE) --push .
+
+docker-push:
+	docker push $(IMAGE)
+
+deploy:
+	kubectl --context $(CONTEXT) apply -k deployment/
+
+undeploy:
+	kubectl --context $(CONTEXT) delete -k deployment/
+
+logs:
+	kubectl --context $(CONTEXT) logs -f deployment/kubernetes-agent -n argo-rollouts
+
+health:
+	kubectl port-forward -n argo-rollouts svc/kubernetes-agent 8080:8080 &
+	sleep 2
+	curl http://localhost:8080/a2a/health
+	pkill -f "port-forward.*kubernetes-agent"
+
+kind-load:
+	kind load docker-image $(IMAGE) --name rollouts-plugin-metric-ai-test-e2e
+
+.PHONY: redeploy
+redeploy: docker-build kind-load deploy
+	kubectl --context $(CONTEXT) rollout restart deployment/kubernetes-agent -n argo-rollouts

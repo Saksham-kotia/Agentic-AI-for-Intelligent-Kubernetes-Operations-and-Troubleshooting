@@ -1,0 +1,288 @@
+package org.csanchez.adk.agents.k8sagent.remediation;
+
+import com.google.adk.tools.Annotations.Schema;
+import org.csanchez.adk.agents.k8sagent.a2a.ModelAnalysisResult;
+import org.kohsuke.github.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Tool that creates GitHub PRs with fixes.
+ * Git operations are deterministic, only the fix content comes from AI.
+ */
+public class GitHubPRTool {
+	
+	private static final Logger logger = LoggerFactory.getLogger(GitHubPRTool.class);
+	private final GitOperations gitOps;
+	
+	public GitHubPRTool(GitOperations gitOps) throws Exception {
+		this.gitOps = gitOps;
+	}
+	
+	public Map<String, Object> create_github_pr(
+			@Schema(name = "repoUrl", description = "The GitHub repository URL to clone and fix") String repoUrl,
+			@Schema(name = "fileChanges", description = "Map of file paths to their new contents") Map<String, String> fileChanges,
+			@Schema(name = "fixDescription", description = "Description of the fix for the PR title and commit message") String fixDescription,
+			@Schema(name = "rootCause", description = "Root cause of the issue") String rootCause,
+			@Schema(name = "namespace", description = "Kubernetes namespace") String namespace,
+			@Schema(name = "podName", description = "Kubernetes pod name") String podName) {
+		logger.info("=== Executing Tool: create_github_pr ===");
+		logger.info("Received params: repoUrl={}, fixDescription={}, rootCause={}, namespace={}, podName={}", repoUrl, fixDescription, rootCause, namespace, podName);
+		
+		if (repoUrl == null || fileChanges == null || fixDescription == null) {
+			return Map.of("success", false, "error", "Missing required parameters: repoUrl, fileChanges, fixDescription");
+		}
+		
+		// Build params map for existing methods
+		Map<String, Object> params = new HashMap<>();
+		params.put("repoUrl", repoUrl);
+		params.put("fileChanges", fileChanges);
+		params.put("fixDescription", fixDescription);
+		params.put("rootCause", rootCause);
+		params.put("namespace", namespace);
+		params.put("podName", podName);
+		
+		logger.info("Creating PR for repository: {}", repoUrl);
+		
+		// Deterministic git workflow (HOW to fix):
+		String branchName = "fix/k8s-issue-" + System.currentTimeMillis();
+		String token = org.csanchez.adk.agents.k8sagent.config.Config.get("GITHUB_TOKEN");
+		Path repoPath = null;
+		
+		try {
+			// 1. Clone (library)
+			repoPath = gitOps.cloneRepository(repoUrl, token);
+			
+			// 2. Create branch (library)
+			gitOps.createBranch(repoPath, branchName);
+			
+			// 3. Apply AI-suggested changes (library file I/O)
+			gitOps.applyChanges(repoPath, fileChanges);
+			
+			// 4. Commit and push (library)
+			String commitMsg = "fix: " + fixDescription;
+			gitOps.commitAndPush(repoPath, commitMsg, token);
+			
+			// 5. Create PR via GitHub API (library)
+			String prTitle = "Fix: " + fixDescription;
+			String prBody = generatePRBody(params);
+			// Intentionally no labels on remediation PRs — the rollback issue
+			// (createRollbackIssue) carries the "jules" label so the Jules agent
+			// picks up the issue, not the PR.
+			GHPullRequest pr = createRemediationPullRequest(repoUrl, branchName, null, prTitle, prBody);
+			
+			logger.info("Successfully created PR: {}", pr.getHtmlUrl());
+			
+			return Map.of(
+				"success", true,
+				"prUrl", pr.getHtmlUrl().toString(),
+				"prNumber", pr.getNumber(),
+				"branch", branchName
+			);
+			
+		} catch (Exception e) {
+			logger.error("Failed to create PR", e);
+			return Map.of(
+				"success", false,
+				"error", e.getMessage()
+			);
+		} finally {
+			// Cleanup temporary directory
+			if (repoPath != null) {
+				gitOps.cleanup(repoPath);
+			}
+		}
+	}
+	
+
+	
+	/**
+	 * Generate PR body with analysis results
+	 */
+	private String generatePRBody(Map<String, Object> params) {
+		String rootCause = (String) params.getOrDefault("rootCause", "Not available");
+		String fixDescription = (String) params.getOrDefault("fixDescription", "");
+		String testingRecommendations = (String) params.getOrDefault("testingRecommendations", "Run existing test suite");
+		String namespace = (String) params.getOrDefault("namespace", "unknown");
+		String podName = (String) params.getOrDefault("podName", "unknown");
+		
+		@SuppressWarnings("unchecked")
+		Map<String, String> fileChanges = (Map<String, String>) params.get("fileChanges");
+		String changesSummary = fileChanges != null ? 
+			String.join(", ", fileChanges.keySet()) : "No files changed";
+		
+		return String.format("""
+			## Root Cause Analysis
+			%s
+			
+			## Changes Made
+			Modified files: %s
+			
+			%s
+			
+			## Testing Recommendations
+			%s
+			
+			## Related Kubernetes Resources
+			- **Namespace**: `%s`
+			- **Pod**: `%s`
+			
+			---
+			*This PR was automatically generated by Kubernetes AI Agent*
+			*Review carefully before merging*
+			""",
+			rootCause,
+			changesSummary,
+			fixDescription,
+			testingRecommendations,
+			namespace,
+			podName
+		);
+	}
+	
+	/**
+	 * Create a consolidated GitHub issue for canary rollback
+	 * Used when multi-model analysis decides to rollback
+	 */
+	public static GHIssue createRollbackIssue(String repoUrl, String rolloutName, String namespace,
+	                                          List<ModelAnalysisResult> modelResults,
+	                                          double promoteScore, double rollbackScore,
+	                                          String votingRationale) throws IOException {
+		logger.info("Creating consolidated rollback issue for rollout: {}/{}", namespace, rolloutName);
+		
+		String token = org.csanchez.adk.agents.k8sagent.config.Config.get("GITHUB_TOKEN");
+		if (token == null || token.isEmpty()) {
+			throw new IllegalStateException("GITHUB_TOKEN environment variable is required");
+		}
+		
+		GitHub github = new GitHubBuilder().withOAuthToken(token).build();
+		String repoName = extractRepoNameStatic(repoUrl);
+		GHRepository repo = github.getRepository(repoName);
+		
+		String issueTitle = String.format("[Canary Rollback] %s/%s", namespace, rolloutName);
+		String issueBody = generateRollbackIssueBody(rolloutName, namespace, modelResults,
+				promoteScore, rollbackScore, votingRationale);
+		
+		GHIssue issue = repo.createIssue(issueTitle)
+				.body(issueBody)
+				.label("canary-rollback")
+				.label("automated")
+				.label("jules")
+				.create();
+		
+		logger.info("Successfully created rollback issue: {}", issue.getHtmlUrl());
+		return issue;
+	}
+
+	/**
+	 * Create the remediation pull request for a remediation branch that has
+	 * already been pushed. Deliberately adds no labels — the "jules" label
+	 * lives on the rollback issue so the Jules agent picks up the issue, not
+	 * the PR.
+	 *
+	 * @param baseBranch base branch name, or null to use the repo's default
+	 */
+	public static GHPullRequest createRemediationPullRequest(String repoUrl, String headBranch,
+			String baseBranch, String title, String body) throws IOException {
+		String token = org.csanchez.adk.agents.k8sagent.config.Config.get("GITHUB_TOKEN");
+		if (token == null || token.isEmpty()) {
+			throw new IllegalStateException("GITHUB_TOKEN environment variable is required");
+		}
+		GitHub github = new GitHubBuilder().withOAuthToken(token).build();
+		GHRepository repo = github.getRepository(extractRepoNameStatic(repoUrl));
+		String base = (baseBranch != null && !baseBranch.isBlank()) ? baseBranch : repo.getDefaultBranch();
+		GHPullRequest pr = repo.createPullRequest(title, headBranch, base, body);
+		logger.info("Successfully created remediation PR: {}", pr.getHtmlUrl());
+		return pr;
+	}
+
+	/**
+	 * Generate issue body for canary rollback
+	 */
+	private static String generateRollbackIssueBody(String rolloutName, String namespace,
+	                                               List<ModelAnalysisResult> modelResults,
+	                                               double promoteScore, double rollbackScore,
+	                                               String votingRationale) {
+		StringBuilder sb = new StringBuilder();
+		
+		// Header
+		sb.append("## Canary Rollback Decision\n\n");
+		sb.append(String.format("**Rollout**: `%s`  \n", rolloutName));
+		sb.append(String.format("**Namespace**: `%s`  \n", namespace));
+		sb.append(String.format("**Timestamp**: `%s`  \n\n",
+				ZonedDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)));
+		
+		// Voting Summary
+		sb.append(String.format("**Decision**: ❌ ROLLBACK (Weighted Vote: Promote %.2f vs Rollback %.2f)\n\n",
+				promoteScore, rollbackScore));
+		
+		// Model Analysis Summary Table
+		sb.append("### Model Analysis Summary\n\n");
+		sb.append("| Model | Recommendation | Confidence | Execution Time |\n");
+		sb.append("|-------|----------------|------------|----------------|\n");
+		
+		for (ModelAnalysisResult result : modelResults) {
+			String recommendation = result.isPromote() ? "✅ PROMOTE" : "❌ ROLLBACK";
+			sb.append(String.format("| %s | %s | %d%% | %dms |\n",
+					result.getModelName(),
+					recommendation,
+					result.getConfidence(),
+					result.getExecutionTimeMs()));
+		}
+		sb.append("\n");
+		
+		// Voting Rationale
+		sb.append("### Voting Rationale\n\n");
+		sb.append("```\n");
+		sb.append(votingRationale);
+		sb.append("```\n\n");
+		
+		// Detailed Analyses
+		sb.append("### Detailed Model Analyses\n\n");
+		
+		for (ModelAnalysisResult result : modelResults) {
+			sb.append(String.format("#### %s\n\n", result.getModelName()));
+			
+			if (result.getError() != null && !result.getError().isEmpty()) {
+				sb.append(String.format("**Error**: %s\n\n", result.getError()));
+				continue;
+			}
+			
+			sb.append(String.format("**Root Cause**: %s\n\n", result.getRootCause()));
+			sb.append(String.format("**Analysis**:\n%s\n\n", result.getAnalysis()));
+			sb.append(String.format("**Remediation**:\n%s\n\n", result.getRemediation()));
+			sb.append("---\n\n");
+		}
+		
+		// Footer
+		sb.append("### Rollout Information\n\n");
+		sb.append(String.format("- **Namespace**: `%s`\n", namespace));
+		sb.append(String.format("- **Rollout**: `%s`\n", rolloutName));
+		sb.append(String.format("- **Timestamp**: `%s`\n\n",
+				ZonedDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)));
+		
+		sb.append("---\n");
+		sb.append("*This issue was automatically created by Kubernetes AI Agent multi-model analysis*\n");
+		
+		return sb.toString();
+	}
+	
+	/**
+	 * Static version of extractRepoName for use in static methods
+	 */
+	private static String extractRepoNameStatic(String repoUrl) {
+		String cleaned = repoUrl.replace("https://github.com/", "")
+				.replace(".git", "");
+		return cleaned;
+	}
+}
+
+

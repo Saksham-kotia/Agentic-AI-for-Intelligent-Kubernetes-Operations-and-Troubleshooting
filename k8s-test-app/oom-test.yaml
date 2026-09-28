@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oom-test
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oom-test
+  template:
+    metadata:
+      labels:
+        app: oom-test
+    spec:
+      containers:
+        - name: app
+          image: python:3.12-alpine
+          command:
+            - python
+            - -c
+            - |
+              data = []
+              while True:
+                  data.append("x" * 1024 * 1024)
+          resources:
+            limits:
+              memory: "32Mi"
+            requests:
+              memory: "16Mi"
